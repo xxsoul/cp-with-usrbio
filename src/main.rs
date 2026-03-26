@@ -23,7 +23,7 @@ use std::{
 use cli::Args;
 use progress::ProgressManager;
 use shm_manager::{cleanup_stale_shm, show_shm_status};
-use task::{collect_tasks, CopyStats, CopyTask};
+use task::{CopyStats, CopyTask};
 use worker_context::worker_thread;
 
 fn main() -> Result<()> {
@@ -164,53 +164,17 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // 收集任务
-    let tasks = collect_tasks(&source, &target, args.recursive)
-        .context("Failed to collect copy tasks")?;
-
-    let total_files = tasks.len();
-    let total_bytes: u64 = tasks.iter().map(|t| t.file_size).sum();
-
-    println!(
-        "Found {} files, total size: {:.2} GB",
-        total_files,
-        total_bytes as f64 / 1_000_000_000.0
-    );
-
-    if total_files == 0 {
-        println!("No files to copy");
-        return Ok(());
-    }
-
-    // 创建进度管理器（文件数>100时启用断点续传）
-    let progress_manager = Arc::new(std::sync::Mutex::new(
-        ProgressManager::new(
-            source.clone(),
-            target.clone(),
-            total_files,
-            args.resume,
-        )
-        .context("Failed to create progress manager")?,
-    ));
-
-    // 如果有已完成的进度，调整统计
-    if let Some((completed, failed, _)) = progress_manager.lock().unwrap().get_stats() {
-        if completed > 0 {
-            println!("Resuming: {} files already completed, {} failed", completed, failed);
-        }
-    }
-    println!();
-
-    // 创建统计和进度条
+    // 创建统计和进度条（先用spinner，后面更新总数）
     let stats = CopyStats::new();
     let progress_bar = if args.progress {
-        let pb = indicatif::ProgressBar::new(total_bytes);
+        let pb = indicatif::ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})\n{msg}")
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
                 .expect("Invalid progress template")
-                .progress_chars("#>-")
         );
+        pb.enable_steady_tick(std::time::Duration::from_millis(200));
+        pb.set_message("Scanning files...");
         Some(pb)
     } else {
         None
@@ -221,10 +185,25 @@ fn main() -> Result<()> {
 
     let start_time = Instant::now();
 
+    // 先启动工作线程
+    // 注意：此时还不知道总文件数，后续更新
+    let progress_manager = Arc::new(std::sync::Mutex::new(
+        ProgressManager::new(
+            source.clone(),
+            target.clone(),
+            0, // 初始为0，后续更新
+            args.resume,
+        )
+        .context("Failed to create progress manager")?,
+    ));
+
+    // 克隆receiver用于workers，保留原始sender用于发送任务
+    let receiver_for_workers = receiver.clone();
+
     // 启动工作线程
     let handles: Vec<_> = (0..args.workers)
         .map(|worker_id| {
-            let receiver = receiver.clone();
+            let receiver = receiver_for_workers.clone();
             let progress_manager = Arc::clone(&progress_manager);
             let mount_point = mount_point.clone();
             let stats_bytes = stats.bytes_copied.clone();
@@ -249,11 +228,56 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    // 发送任务
-    for task in tasks {
-        sender.send(task).context("Failed to send task")?;
+    // drop原始receiver，避免死锁
+    drop(receiver);
+
+    // Walk模式：边遍历边发送任务
+    println!("🚶 Walking directory and sending tasks...");
+    let (total_files, total_bytes, sender) = task::walk_and_send_tasks(
+        &source,
+        &target,
+        args.recursive,
+        sender,
+    ).context("Failed to walk and send tasks")?;
+
+    // drop sender关闭通道
+    drop(sender);
+
+    // 更新进度管理器的总文件数
+    progress_manager.lock().unwrap().update_total_files(total_files);
+
+    // 如果有已完成的进度，显示
+    if let Some((completed, failed, _)) = progress_manager.lock().unwrap().get_stats() {
+        if completed > 0 {
+            println!("Resuming: {} files already completed, {} failed", completed, failed);
+        }
     }
-    drop(sender); // 关闭通道
+
+    // 更新进度条为实际的总字节数
+    if let Some(ref pb) = progress_bar {
+        pb.set_length(total_bytes);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})\n{msg}")
+                .expect("Invalid progress template")
+                .progress_chars("#>-")
+        );
+        pb.set_message("");
+    }
+
+    println!(
+        "Found {} files, total size: {:.2} GB",
+        total_files,
+        total_bytes as f64 / 1_000_000_000.0
+    );
+    println!();
+
+    if total_files == 0 {
+        println!("No files to copy");
+        return Ok(());
+    }
+
+    // sender已在walk_and_send_tasks中drop，无需手动drop
 
     // 等待所有工作线程完成
     for handle in handles {

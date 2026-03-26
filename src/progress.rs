@@ -266,6 +266,13 @@ impl ProgressManager {
             )
         })
     }
+
+    /// 更新总文件数
+    pub fn update_total_files(&mut self, total: usize) {
+        if let Some(state) = &mut self.state {
+            state.total_files = total;
+        }
+    }
 }
 
 impl Drop for ProgressManager {

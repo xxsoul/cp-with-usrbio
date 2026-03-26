@@ -351,35 +351,57 @@ impl WorkerContext {
 
                 // 提交并等待完成
                 final_ior.submit();
-                let completed = final_ior.poll::<(usize, usize)>(1..=final_inflight.len(), 60000);
 
-                if completed.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "Final batch poll timeout with {} I/Os",
-                        final_inflight.len()
-                    ));
+                // 循环poll直到所有I/O完成
+                let mut final_completed_count = 0;
+                let mut poll_attempts = 0;
+                const MAX_POLL_ATTEMPTS: usize = 10;
+
+                while final_completed_count < final_inflight.len() && poll_attempts < MAX_POLL_ATTEMPTS {
+                    let completed = final_ior.poll::<(usize, usize)>(1..=final_inflight.len() - final_completed_count, 60000);
+
+                    if completed.is_empty() {
+                        poll_attempts += 1;
+                        if self.debug {
+                            if let Some(ref pb) = self.progress_bar {
+                                pb.println(format!(
+                                    "[Worker {}] Final batch poll attempt {} returned empty, {}/{} completed",
+                                    self.worker_id, poll_attempts, final_completed_count, final_inflight.len()
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
+                    // 处理完成的I/O
+                    for io in completed {
+                        if io.result < 0 {
+                            return Err(anyhow::anyhow!(
+                                "Final write failed at offset {}: error {}",
+                                io.extra.0, io.result
+                            ));
+                        }
+                        if io.result as usize != io.extra.1 {
+                            return Err(anyhow::anyhow!(
+                                "Final write incomplete: expected {}, got {}",
+                                io.extra.1, io.result
+                            ));
+                        }
+
+                        completed_bytes += io.result as usize;
+                        final_completed_count += 1;
+                        self.stats_bytes.fetch_add(io.result as u64, Ordering::Relaxed);
+                        if let Some(ref pb) = self.progress_bar {
+                            pb.inc(io.result as u64);
+                        }
+                    }
                 }
 
-                // 处理完成的I/O
-                for io in completed {
-                    if io.result < 0 {
-                        return Err(anyhow::anyhow!(
-                            "Final write failed at offset {}: error {}",
-                            io.extra.0, io.result
-                        ));
-                    }
-                    if io.result as usize != io.extra.1 {
-                        return Err(anyhow::anyhow!(
-                            "Final write incomplete: expected {}, got {}",
-                            io.extra.1, io.result
-                        ));
-                    }
-
-                    completed_bytes += io.result as usize;
-                    self.stats_bytes.fetch_add(io.result as u64, Ordering::Relaxed);
-                    if let Some(ref pb) = self.progress_bar {
-                        pb.inc(io.result as u64);
-                    }
+                if final_completed_count < final_inflight.len() {
+                    return Err(anyhow::anyhow!(
+                        "Final batch incomplete: only {}/{} I/Os completed after {} attempts",
+                        final_completed_count, final_inflight.len(), poll_attempts
+                    ));
                 }
 
                 // 同步所有写入，确保数据持久化
