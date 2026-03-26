@@ -112,25 +112,24 @@ Worker Thread:
 ### 构建命令
 
 ```bash
-# 标准构建
+# 标准构建（推荐使用构建脚本）
+./build.sh
+
+# 输出位置: ../target/cp-with-usrbio
+
+# 或手动构建
 export HF3FS_BUILD_DIR=/root/code/3fs/build
 export LD_LIBRARY_PATH=$HF3FS_BUILD_DIR/src/lib/api:$LD_LIBRARY_PATH
 cargo build --release
-
-# 输出: target/release/cp-with-usrbio
-
-# 或使用构建脚本
-./build.sh
+cp target/release/cp-with-usrbio ../target/
 ```
 
 ### 部署位置
 
 ```bash
-# 编译输出
-target/release/cp-with-usrbio
-
-# 部署目录
-/root/code/target/cp-with-usrbio
+# 编译输出（自动复制到父目录）
+../target/cp-with-usrbio
+# 即: /root/code/target/cp-with-usrbio
 ```
 
 ### 运行要求

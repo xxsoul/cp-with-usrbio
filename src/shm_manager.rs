@@ -5,7 +5,7 @@ use std::backtrace::Backtrace;
 use std::fs;
 
 /// 获取/dev/shm的可用空间（字节）
-fn get_shm_available_space() -> Result<u64> {
+pub fn get_shm_available_space() -> Result<u64> {
     // 使用statvfs获取文件系统统计信息
     let mut statvfs: libc::statvfs = unsafe { std::mem::zeroed() };
     let c_path = std::ffi::CString::new("/dev/shm").context("Invalid path")?;
@@ -20,6 +20,23 @@ fn get_shm_available_space() -> Result<u64> {
     // 计算可用空间：块大小 * 可用块数
     let available = statvfs.f_bsize as u64 * statvfs.f_bavail as u64;
     Ok(available)
+}
+
+/// 获取/dev/shm的总大小（字节）
+pub fn get_total_shm_size() -> Result<u64> {
+    let mut statvfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    let c_path = std::ffi::CString::new("/dev/shm").context("Invalid path")?;
+
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut statvfs) };
+    if result != 0 {
+        return Err(anyhow::anyhow!(
+            "Failed to get /dev/shm filesystem stats"
+        ));
+    }
+
+    // 计算总大小：块大小 * 总块数
+    let total = statvfs.f_blocks as u64 * statvfs.f_bsize as u64;
+    Ok(total)
 }
 
 /// 获取/dev/shm的总大小和已用空间
@@ -272,19 +289,31 @@ impl ShmManager {
 /// 清理所有遗留的共享内存文件
 pub fn cleanup_stale_shm() -> Result<usize> {
     let mut cleaned = 0;
+    let mut failed = 0;
 
     if let Ok(entries) = fs::read_dir("/dev/shm") {
         for entry in entries.filter_map(|e| e.ok()) {
             if let Ok(name) = entry.file_name().into_string() {
                 // 清理我们创建的共享内存文件
-                if name.starts_with("cp_usrbio_") {
+                if name.starts_with("cp_usrbio_") || name.starts_with("cp_usrbio.") {
                     let path = entry.path();
-                    if fs::remove_file(&path).is_ok() {
-                        cleaned += 1;
+                    match fs::remove_file(&path) {
+                        Ok(_) => {
+                            eprintln!("  Cleaned: {}", name);
+                            cleaned += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("  Failed to clean {}: {}", name, e);
+                            failed += 1;
+                        }
                     }
                 }
             }
         }
+    }
+
+    if failed > 0 {
+        eprintln!("Warning: Failed to clean {} files (may need root permissions)", failed);
     }
 
     Ok(cleaned)
@@ -317,7 +346,7 @@ pub fn show_shm_status() -> Result<()> {
         let mut our_files = Vec::new();
         for entry in entries.filter_map(|e| e.ok()) {
             if let Ok(name) = entry.file_name().into_string() {
-                if name.starts_with("cp_usrbio_") {
+                if name.starts_with("cp_usrbio") {
                     if let Ok(metadata) = entry.metadata() {
                         our_files.push((name, metadata.len()));
                     }
@@ -326,7 +355,7 @@ pub fn show_shm_status() -> Result<()> {
         }
 
         if !our_files.is_empty() {
-            println!("\n📁 Active cp-with-usrbio shared memory files:");
+            println!("\n⚠️  Found {} cp-with-usrbio shared memory files:", our_files.len());
             let total_ours: u64 = our_files.iter().map(|(_, size)| *size).sum();
             for (name, size) in our_files {
                 println!("  {} ({:.2} MB)", name, size as f64 / 1_000_000.0);
@@ -335,6 +364,7 @@ pub fn show_shm_status() -> Result<()> {
                 "Total: {:.2} MB",
                 total_ours as f64 / 1_000_000.0
             );
+            println!("\n💡 Run with --shm-status to clean them up");
         }
     }
 

@@ -80,29 +80,11 @@ fn main() -> Result<()> {
         ));
     }
 
-    // 验证共享内存容量限制
-    if args.block_size > args.max_iov_size {
+    // 验证共享内存使用比例
+    if args.shm_usage_ratio <= 0.0 || args.shm_usage_ratio > 1.0 {
         return Err(anyhow::anyhow!(
-            "block_size ({}) cannot be larger than max_iov_size ({})",
-            args.block_size,
-            args.max_iov_size
-        ));
-    }
-
-    let max_depth_by_shm = args.max_iov_size / args.block_size;
-    if args.pipeline_depth > max_depth_by_shm {
-        return Err(anyhow::anyhow!(
-            "pipeline_depth ({}) exceeds maximum depth ({}) allowed by max_iov_size/block_size ratio",
-            args.pipeline_depth,
-            max_depth_by_shm
-        ));
-    }
-
-    if args.max_pipeline_depth > max_depth_by_shm {
-        return Err(anyhow::anyhow!(
-            "max_pipeline_depth ({}) exceeds maximum depth ({}) allowed by max_iov_size/block_size ratio",
-            args.max_pipeline_depth,
-            max_depth_by_shm
+            "shm_usage_ratio must be between 0.0 and 1.0, got {}",
+            args.shm_usage_ratio
         ));
     }
 
@@ -117,6 +99,44 @@ fn main() -> Result<()> {
         }
     }
 
+    // 计算每个 worker 的固定共享内存大小
+    let total_shm = shm_manager::get_total_shm_size()?;
+    let available_shm = shm_manager::get_shm_available_space()?;
+    let usable_shm = (total_shm as f64 * args.shm_usage_ratio) as u64;
+
+    // 确保不超过可用空间
+    let actual_usable = usable_shm.min(available_shm);
+
+    // 计算每个 worker 的固定大小
+    let iov_size_per_worker = if args.workers > 0 {
+        actual_usable / args.workers as u64
+    } else {
+        return Err(anyhow::anyhow!("workers must be at least 1"));
+    };
+
+    // 确保每个 worker 至少有一个 block_size
+    let iov_size_per_worker = iov_size_per_worker.max(args.block_size as u64) as usize;
+
+    // 验证 pipeline_depth 不超过 iov_size / block_size
+    let max_depth_by_shm = iov_size_per_worker / args.block_size;
+    if args.pipeline_depth > max_depth_by_shm {
+        return Err(anyhow::anyhow!(
+            "pipeline_depth ({}) exceeds maximum depth ({}) allowed by iov_size_per_worker/block_size ratio.\n\
+             Try: reduce --workers or increase --shm-usage-ratio",
+            args.pipeline_depth,
+            max_depth_by_shm
+        ));
+    }
+
+    if args.max_pipeline_depth > max_depth_by_shm {
+        return Err(anyhow::anyhow!(
+            "max_pipeline_depth ({}) exceeds maximum depth ({}) allowed by iov_size_per_worker/block_size ratio.\n\
+             Try: reduce --workers or increase --shm-usage-ratio",
+            args.max_pipeline_depth,
+            max_depth_by_shm
+        ));
+    }
+
     // 显示共享内存状态
     if let Err(e) = show_shm_status() {
         eprintln!("Warning: Failed to get shared memory status: {}", e);
@@ -128,12 +148,16 @@ fn main() -> Result<()> {
     println!("Target: {:?}", target);
     println!("Mount point: {}", mount_point);
     println!("Workers: {}", args.workers);
-    println!("Block size: {} bytes", args.block_size);
+    println!("Block size: {} bytes ({:.2} MB)", args.block_size, args.block_size as f64 / 1_000_000.0);
     println!(
         "Pipeline depth: {} - {} (auto-adjusted per file)",
         args.pipeline_depth, args.max_pipeline_depth
     );
-    println!("Max shared memory: {} bytes ({:.2} GB)", args.max_iov_size, args.max_iov_size as f64 / 1_000_000_000.0);
+    println!("Shared memory per worker: {} bytes ({:.2} MB)", iov_size_per_worker, iov_size_per_worker as f64 / 1_000_000.0);
+    println!("Total shared memory usage: {:.2} MB ({:.0}% of total)",
+        (iov_size_per_worker * args.workers) as f64 / 1_000_000.0,
+        args.shm_usage_ratio * 100.0
+    );
     println!("Resume enabled: {}", args.resume);
     if args.debug {
         println!("Debug mode: ENABLED");
@@ -214,7 +238,7 @@ fn main() -> Result<()> {
                     args.block_size,
                     args.pipeline_depth,
                     args.max_pipeline_depth,
-                    args.max_iov_size,
+                    iov_size_per_worker,
                     stats_bytes,
                     progress_bar,
                     args.preserve_attrs,

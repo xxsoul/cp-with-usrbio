@@ -184,7 +184,21 @@ impl ProgressManager {
         }
 
         if let Some(state) = &self.state {
-            !state.is_completed(relative_path)
+            // 如果不在已完成列表中，需要处理
+            if !state.is_completed(relative_path) {
+                return true;
+            }
+
+            // 如果在已完成列表中，验证目标文件是否存在
+            let target_path = state.target.join(relative_path);
+            if !target_path.exists() {
+                // 目标文件不存在，需要重新处理
+                eprintln!("⚠ Target file missing, will re-copy: {}", relative_path);
+                return true;
+            }
+
+            // 目标文件存在，跳过
+            false
         } else {
             true
         }

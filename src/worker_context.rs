@@ -18,32 +18,59 @@ use crate::task::CopyTask;
 
 /// Worker 线程上下文
 ///
-/// 持有可复用的资源：iov、ior、共享内存
+/// 持有可复用的资源：iov、共享内存
 pub struct WorkerContext {
     worker_id: usize,
     mount_point: String,
     block_size: usize,
     min_pipeline_depth: usize,
     max_pipeline_depth: usize,
-    max_iov_size: usize,
+    iov_size: usize,  // 固定大小，不再动态调整
     stats_bytes: std::sync::Arc<AtomicU64>,
     progress_bar: Option<ProgressBar>,
     preserve_attrs: bool,
     debug: bool,
 
-    // 复用的资源
-    shm_manager: Option<ShmManager>,
-    current_iov_size: usize,
+    // 固定资源（初始化时创建，不再改变）
+    shm_manager: ShmManager,
 }
 
 /// 共享内存管理器（简化版）
 struct ShmManager {
-    #[allow(dead_code)]
     shm: shared_memory::Shmem,
     iov: Iov,
-    #[allow(dead_code)]
     shm_id: String,
+    mount_point: String,
+    #[allow(dead_code)]
     size: usize,
+}
+
+impl Drop for ShmManager {
+    fn drop(&mut self) {
+        // 在drop iov之前，清理符号链接
+        // Iov结构体中的id字段就是uuid (C char数组，需要转换)
+        let iov_id_bytes: [u8; 16] = unsafe {
+            std::mem::transmute(self.iov.0.id)
+        };
+        let iov_id = uuid::Uuid::from_bytes(iov_id_bytes);
+        let symlink_path = format!(
+            "{}/3fs-virt/iovs/{}",
+            self.mount_point.trim_end_matches('/'),
+            iov_id.as_hyphenated()
+        );
+
+        eprintln!("[DEBUG] ShmManager::Drop - Cleaning up symlink: {}", symlink_path);
+
+        // 尝试删除符号链接
+        if let Err(e) = std::fs::remove_file(&symlink_path) {
+            eprintln!("[WARNING] Failed to remove symlink {}: {}", symlink_path, e);
+        }
+
+        // 然后iov和shm会自动drop
+        // Rust会自动按字段声明逆序drop：
+        // size → shm_id → iov (调用hf3fs_iovdestroy) → shm (释放共享内存)
+        eprintln!("[DEBUG] ShmManager::Drop - iov and shm will be auto-dropped");
+    }
 }
 
 impl WorkerContext {
@@ -53,91 +80,69 @@ impl WorkerContext {
         block_size: usize,
         min_pipeline_depth: usize,
         max_pipeline_depth: usize,
-        max_iov_size: usize,
+        iov_size: usize,
         stats_bytes: std::sync::Arc<AtomicU64>,
         progress_bar: Option<ProgressBar>,
         preserve_attrs: bool,
         debug: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        // 立即创建固定大小的共享内存
+        let shm_id = format!("cp_usrbio_w{}", worker_id);
+        let shm = ShmemConf::new()
+            .os_id(&shm_id)
+            .size(iov_size)
+            .create()
+            .with_context(|| {
+                format!(
+                    "Worker {} failed to create shared memory: size={} bytes ({:.2} MB)",
+                    worker_id, iov_size, iov_size as f64 / 1_000_000.0
+                )
+            })?;
+
+        // 创建iov（这会创建符号链接）
+        let iov = Iov::wrap(&mount_point, &shm, -1).map_err(|e| {
+            anyhow::anyhow!(
+                "Worker {} failed to create Iov: {}",
+                worker_id, e
+            )
+        })?;
+
+        let shm_manager = ShmManager {
+            shm,
+            iov,
+            shm_id,
+            mount_point: mount_point.clone(),
+            size: iov_size,
+        };
+
+        if debug {
+            if let Some(ref pb) = progress_bar {
+                pb.println(format!(
+                    "[Worker {}] Initialized with fixed shared memory: {:.2} MB",
+                    worker_id,
+                    iov_size as f64 / 1_000_000.0
+                ));
+            }
+        }
+
+        Ok(Self {
             worker_id,
             mount_point,
             block_size,
             min_pipeline_depth,
             max_pipeline_depth,
-            max_iov_size,
+            iov_size,
             stats_bytes,
             progress_bar,
             preserve_attrs,
             debug,
-            shm_manager: None,
-            current_iov_size: 0,
-        }
+            shm_manager,
+        })
     }
 
-    /// 确保共享内存足够大
-    fn ensure_shm_capacity(&mut self, required_size: usize) -> Result<()> {
-        // 如果已存在且大小足够，直接返回
-        if let Some(ref shm) = self.shm_manager {
-            if shm.size >= required_size {
-                return Ok(());
-            }
-        }
-
-        // 需要重新创建更大的共享内存
-        if self.debug {
-            if let Some(ref pb) = self.progress_bar {
-                pb.println(format!(
-                    "[Worker {}] Resizing shared memory: {} -> {} bytes",
-                    self.worker_id, self.current_iov_size, required_size
-                ));
-            }
-        }
-
-        // 销毁旧的
-        self.shm_manager = None;
-
-        // 创建新的
-        let shm_id = format!("cp_usrbio_w{}", self.worker_id);
-        let shm = ShmemConf::new()
-            .os_id(&shm_id)
-            .size(required_size)
-            .create()
-            .with_context(|| {
-                format!(
-                    "Worker {} failed to create shared memory: size={}",
-                    self.worker_id, required_size
-                )
-            })?;
-
-        let iov = Iov::wrap(&self.mount_point, &shm, -1).map_err(|e| {
-            anyhow::anyhow!(
-                "Worker {} failed to create Iov: {}",
-                self.worker_id, e
-            )
-        })?;
-
-        self.shm_manager = Some(ShmManager {
-            shm,
-            iov,
-            shm_id,
-            size: required_size,
-        });
-        self.current_iov_size = required_size;
-
-        Ok(())
-    }
-
-    /// 计算实际需要的共享内存大小
-    fn calculate_iov_size(&self, file_size: u64) -> usize {
-        let size = file_size as usize;
-        let min_size = self.block_size;
-        size.max(min_size).min(self.max_iov_size)
-    }
-
-    /// 计算最优的pipeline深度
-    fn calculate_pipeline_depth(&self, file_size: u64, iov_size: usize) -> usize {
-        let max_depth_by_shm = iov_size / self.block_size;
+    /// 计算最优的pipeline深度（使用固定的iov_size）
+    fn calculate_pipeline_depth(&self, file_size: u64) -> usize {
+        let max_depth_by_shm = self.iov_size / self.block_size;
         if max_depth_by_shm == 0 {
             return 1;
         }
@@ -199,20 +204,12 @@ impl WorkerContext {
         let raw_fd = dst_file.into_raw_fd();
         let managed_fd = unsafe { ManagedFd::from_raw_fd(raw_fd) };
 
-        // 3. 确保共享内存足够
-        let iov_size = self.calculate_iov_size(file_size);
-        self.ensure_shm_capacity(iov_size)?;
-
-        // 提取 iov 和 shm_ptr（避免借用冲突）
-        let (iov_ptr, shm_ptr) = {
-            let shm_manager = self.shm_manager.as_ref().unwrap();
-            let iov_ptr = &shm_manager.iov as *const Iov;
-            let shm_ptr = shm_manager.shm.as_ptr();
-            (iov_ptr, shm_ptr)
-        };
+        // 3. 获取 iov 和 shm_ptr（固定大小，不再调整）
+        let iov_ptr = &self.shm_manager.iov as *const Iov;
+        let shm_ptr = self.shm_manager.shm.as_ptr();
 
         // 4. 执行 Pipeline 拷贝
-        let pipeline_depth = self.calculate_pipeline_depth(file_size, iov_size);
+        let pipeline_depth = self.calculate_pipeline_depth(file_size);
 
         // 创建 Ior（每个文件创建新的，因为需要不同的 pipeline_depth）
         let ior = Ior::create(
@@ -277,16 +274,154 @@ impl WorkerContext {
         let mut inflight: VecDeque<(usize, usize, usize)> = VecDeque::new();
         let mut src_offset: usize = 0;
         let mut completed_bytes: usize = 0;
-        let mut buf_offset_counter: usize = 0;
+        let mut next_buf_offset: usize = 0;  // 下一个可用的缓冲区位置
 
         while completed_bytes < file_size as usize {
-            // 阶段1: 准备 I/O
+            // 检查是否是最后一批不足的情况
+            let remaining_bytes = file_size as usize - src_offset;
+            let remaining_ios = (remaining_bytes + self.block_size - 1) / self.block_size;
+            let is_potential_final_batch = remaining_ios < pipeline_depth && remaining_ios > 0;
+
+            // 如果是最后一批不足，直接用final_ior处理，不prepare到ior
+            if is_potential_final_batch && inflight.is_empty() {
+                if self.debug {
+                    if let Some(ref pb) = self.progress_bar {
+                        pb.println(format!(
+                            "[Worker {}] Handling final batch with {} I/Os (partial batch)",
+                            self.worker_id, remaining_ios
+                        ));
+                    }
+                }
+
+                // 读取所有剩余数据并prepare到final_ior
+                let final_ior = Ior::create(
+                    &self.mount_point,
+                    false,
+                    remaining_ios as i32,
+                    0,    // io_depth = 0（非批处理模式）
+                    1000,
+                    -1,
+                    0,
+                ).map_err(|e| anyhow::anyhow!("Failed to create final Ior: {}", e))?;
+
+                let mut final_inflight = Vec::new();
+
+                while src_offset < file_size as usize {
+                    let chunk_size = std::cmp::min(self.block_size, file_size as usize - src_offset);
+
+                    // 检查缓冲区空间
+                    if next_buf_offset + chunk_size > self.iov_size {
+                        if inflight.is_empty() {
+                            next_buf_offset = 0;
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Insufficient buffer space for final batch"
+                            ));
+                        }
+                    }
+
+                    let buf_offset = next_buf_offset;
+
+                    // 读取数据
+                    unsafe {
+                        let buf_slice = std::slice::from_raw_parts_mut(
+                            shm_ptr.add(buf_offset),
+                            chunk_size,
+                        );
+                        src_file.read_exact(buf_slice)
+                            .with_context(|| "Failed to read from source")?;
+                    }
+
+                    // Prepare到final_ior
+                    final_ior.prepare_raw(
+                        iov,
+                        buf_offset..buf_offset + chunk_size,
+                        fd,
+                        src_offset,
+                        (src_offset, chunk_size),
+                    ).map_err(|e| {
+                        anyhow::anyhow!("Failed to prepare final I/O: offset={}, size={}, error={}",
+                            src_offset, chunk_size, e)
+                    })?;
+
+                    final_inflight.push((src_offset, chunk_size, buf_offset));
+                    src_offset += chunk_size;
+                    next_buf_offset += chunk_size;
+                }
+
+                // 提交并等待完成
+                final_ior.submit();
+                let completed = final_ior.poll::<(usize, usize)>(1..=final_inflight.len(), 60000);
+
+                if completed.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Final batch poll timeout with {} I/Os",
+                        final_inflight.len()
+                    ));
+                }
+
+                // 处理完成的I/O
+                for io in completed {
+                    if io.result < 0 {
+                        return Err(anyhow::anyhow!(
+                            "Final write failed at offset {}: error {}",
+                            io.extra.0, io.result
+                        ));
+                    }
+                    if io.result as usize != io.extra.1 {
+                        return Err(anyhow::anyhow!(
+                            "Final write incomplete: expected {}, got {}",
+                            io.extra.1, io.result
+                        ));
+                    }
+
+                    completed_bytes += io.result as usize;
+                    self.stats_bytes.fetch_add(io.result as u64, Ordering::Relaxed);
+                    if let Some(ref pb) = self.progress_bar {
+                        pb.inc(io.result as u64);
+                    }
+                }
+
+                // 同步所有写入，确保数据持久化
+                unsafe {
+                    libc::ioctl(fd, hf3fs_usrbio_sys::HF3FS_SUPER_MAGIC as _);
+                }
+
+                // 最后一批处理完成，退出循环
+                break;
+            }
+
+            // 阶段1: 准备 I/O（正常批次）
             while inflight.len() < pipeline_depth && src_offset < file_size as usize {
-                let buf_offset = (buf_offset_counter * self.block_size) % self.current_iov_size;
                 let chunk_size = std::cmp::min(self.block_size, file_size as usize - src_offset);
 
-                if buf_offset + chunk_size > self.current_iov_size {
-                    break;
+                // 检查是否有足够的缓冲区空间
+                if next_buf_offset + chunk_size > self.iov_size {
+                    // 如果inflight为空，可以安全重置缓冲区位置
+                    if inflight.is_empty() {
+                        next_buf_offset = 0;
+                        if self.debug {
+                            if let Some(ref pb) = self.progress_bar {
+                                pb.println(format!(
+                                    "[Worker {}] Reset buffer offset for next batch",
+                                    self.worker_id
+                                ));
+                            }
+                        }
+                    } else {
+                        // 缓冲区不够，等待 inflight 完成
+                        break;
+                    }
+                }
+
+                let buf_offset = next_buf_offset;
+
+                // 额外检查：确保chunk_size不超过iov_size
+                if chunk_size > self.iov_size {
+                    return Err(anyhow::anyhow!(
+                        "Chunk size {} exceeds iov_size {}. This should not happen (block_size = {})",
+                        chunk_size, self.iov_size, self.block_size
+                    ));
                 }
 
                 // 读取数据
@@ -311,7 +446,12 @@ impl WorkerContext {
 
                 inflight.push_back((src_offset, chunk_size, buf_offset));
                 src_offset += chunk_size;
-                buf_offset_counter += 1;
+                next_buf_offset += chunk_size;
+
+                // 如果缓冲区用完，等待 inflight 完成
+                if next_buf_offset >= self.iov_size {
+                    break;
+                }
             }
 
             // 阶段2: 提交并等待完成
@@ -322,10 +462,19 @@ impl WorkerContext {
                 let completed = ior.poll::<(usize, usize)>(1..=max_poll, 30000);
 
                 if completed.is_empty() && !inflight.is_empty() {
+                    if self.debug {
+                        if let Some(ref pb) = self.progress_bar {
+                            pb.println(format!(
+                                "[Worker {}] Poll timeout, inflight: {:?}",
+                                self.worker_id, inflight
+                            ));
+                        }
+                    }
                     return Err(anyhow::anyhow!("Poll timeout after 30s"));
                 }
 
                 // 处理完成的 I/O
+                let mut bytes_completed_this_round = 0;
                 for io in completed {
                     if io.result < 0 {
                         return Err(anyhow::anyhow!(
@@ -341,12 +490,18 @@ impl WorkerContext {
                     }
 
                     completed_bytes += io.result as usize;
+                    bytes_completed_this_round += io.result as usize;
                     inflight.pop_front();
 
                     self.stats_bytes.fetch_add(io.result as u64, Ordering::Relaxed);
                     if let Some(ref pb) = self.progress_bar {
                         pb.inc(io.result as u64);
                     }
+                }
+
+                // 如果所有 inflight 都完成了，重置缓冲区位置
+                if inflight.is_empty() {
+                    next_buf_offset = 0;
                 }
             }
         }
@@ -371,26 +526,32 @@ pub fn worker_thread(
     block_size: usize,
     min_pipeline_depth: usize,
     max_pipeline_depth: usize,
-    max_iov_size: usize,
+    iov_size: usize,
     stats_bytes: std::sync::Arc<AtomicU64>,
     progress_bar: Option<ProgressBar>,
     preserve_attrs: bool,
     debug: bool,
     progress_manager: std::sync::Arc<std::sync::Mutex<ProgressManager>>,
 ) {
-    // 创建 worker 上下文（复用资源）
-    let mut ctx = WorkerContext::new(
+    // 创建 worker 上下文（固定大小的共享内存）
+    let mut ctx = match WorkerContext::new(
         worker_id,
         mount_point,
         block_size,
         min_pipeline_depth,
         max_pipeline_depth,
-        max_iov_size,
+        iov_size,
         stats_bytes,
-        progress_bar,
+        progress_bar.clone(),
         preserve_attrs,
         debug,
-    );
+    ) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("[Worker {}] Failed to initialize: {}", worker_id, e);
+            return;
+        }
+    };
 
     // 处理任务
     while let Ok(task) = receiver.recv() {

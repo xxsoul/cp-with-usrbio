@@ -32,10 +32,10 @@ pub struct Args {
     #[arg(long, default_value = "8")]
     pub max_pipeline_depth: usize,
 
-    /// 共享内存最大大小（字节），默认1GB
-    /// 实际使用时根据文件大小动态调整，不会超过此值
-    #[arg(long, default_value = "1073741824")]
-    pub max_iov_size: usize,
+    /// 共享内存使用比例（占总共享内存的百分比）
+    /// 例如：0.95 表示使用总共享内存的95%
+    #[arg(long, default_value = "0.95")]
+    pub shm_usage_ratio: f64,
 
     /// 是否启用断点续传（文件数>100时自动启用）
     #[arg(long, default_value = "true")]

@@ -20,9 +20,16 @@ fi
 # 构建
 cargo build --release
 
+# 确保 ../target 目录存在
+mkdir -p ../target
+
+# 复制二进制文件到 ../target
+cp -f target/release/cp-with-usrbio ../target/
+chmod +x ../target/cp-with-usrbio
+
 echo "✅ Build successful!"
-echo "Binary: target/release/cp-with-usrbio"
+echo "Binary: ../target/cp-with-usrbio"
 echo ""
 echo "To run:"
 echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-echo "./target/release/cp-with-usrbio --help"
+echo "../target/cp-with-usrbio --help"
