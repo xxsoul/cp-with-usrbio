@@ -7,11 +7,21 @@ use anyhow::{Context, Result};
 use crossbeam::channel::Sender;
 use walkdir::WalkDir;
 
+/// 文件校验结果
+#[derive(Debug, Clone)]
+pub struct VerifyResult {
+    pub missing_files: Vec<String>,      // target缺失的文件
+    pub size_mismatch: Vec<String>,      // 大小不一致的文件
+    pub total_checked: usize,            // 总检查文件数
+    pub total_issues: usize,             // 总问题文件数
+}
+
 /// 拷贝任务定义
 #[derive(Debug)]
 pub struct CopyTask {
     pub src_path: PathBuf,
     pub dst_path: PathBuf,
+    #[allow(dead_code)]
     pub file_size: u64,
     pub relative_path: String, // 相对路径，用于断点续传
 }
@@ -35,6 +45,7 @@ impl CopyStats {
 }
 
 /// 收集拷贝任务
+#[allow(dead_code)]
 pub fn collect_tasks(source: &Path, target: &Path, recursive: bool) -> Result<Vec<CopyTask>> {
     let mut tasks = Vec::new();
 
@@ -193,10 +204,114 @@ pub fn walk_and_send_tasks(
 
             // 定期打印进度（每100个文件）
             if total_files % 100 == 0 {
-                eprintln!("🔍 Scanned {} files, {:.2} GB...", total_files, total_bytes as f64 / 1_000_000_000.0);
+                eprintln!("🔍 Scanned {} files, {:.2} GiB...", total_files, total_bytes as f64 / 1_073_741_824.0);
             }
         }
     }
 
     Ok((total_files, total_bytes, sender))
+}
+
+/// 校验source和target文件一致性（仅比较文件大小）
+///
+/// 返回：需要重传的文件列表（相对路径）
+pub fn verify_files(
+    source: &Path,
+    target: &Path,
+    recursive: bool,
+) -> Result<VerifyResult> {
+    let mut missing_files = Vec::new();
+    let mut size_mismatch = Vec::new();
+    let mut total_checked = 0;
+
+    if source.is_file() {
+        // 单文件模式
+        total_checked = 1;
+
+        let src_metadata = std::fs::metadata(source)
+            .with_context(|| format!("Failed to get metadata: {:?}", source))?;
+
+        if !target.exists() {
+            let relative_path = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            missing_files.push(relative_path);
+        } else {
+            let dst_metadata = std::fs::metadata(target)
+                .with_context(|| format!("Failed to get metadata: {:?}", target))?;
+
+            if src_metadata.len() != dst_metadata.len() {
+                let relative_path = source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                size_mismatch.push(relative_path);
+            }
+        }
+    } else if source.is_dir() {
+        if !recursive {
+            return Err(anyhow::anyhow!(
+                "Source is a directory, but --recursive flag is not set"
+            ));
+        }
+
+        // 遍历源目录
+        for entry in WalkDir::new(source)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file() {
+                total_checked += 1;
+
+                let src_path = entry.path();
+                let rel_path = src_path.strip_prefix(source)?;
+                let dst_path = target.join(rel_path);
+
+                // 获取源文件大小
+                let src_metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to get metadata for {:?}: {}", src_path, e);
+                        continue;
+                    }
+                };
+
+                // 检查目标文件是否存在
+                if !dst_path.exists() {
+                    let relative_path = rel_path.to_str().unwrap_or("unknown").to_string();
+                    missing_files.push(relative_path);
+                    continue;
+                }
+
+                // 检查文件大小
+                let dst_metadata = match std::fs::metadata(&dst_path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to get metadata for {:?}: {}", dst_path, e);
+                        continue;
+                    }
+                };
+
+                if src_metadata.len() != dst_metadata.len() {
+                    let relative_path = rel_path.to_str().unwrap_or("unknown").to_string();
+                    size_mismatch.push(relative_path);
+                }
+            }
+        }
+    } else {
+        return Err(anyhow::anyhow!("Source path does not exist: {:?}", source));
+    }
+
+    let total_issues = missing_files.len() + size_mismatch.len();
+
+    Ok(VerifyResult {
+        missing_files,
+        size_mismatch,
+        total_checked,
+        total_issues,
+    })
 }

@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(cargo clean:*)",
+      "Bash(cargo build:*)",
+      "Bash(export HF3FS_BUILD_DIR=/root/code/3fs/build)",
+      "Bash(./build.sh)"
     ]
   }
 }

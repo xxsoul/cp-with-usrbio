@@ -273,6 +273,29 @@ impl ProgressManager {
             state.total_files = total;
         }
     }
+
+    /// 获取失败任务列表（相对路径）
+    pub fn get_failed_files(&self) -> Vec<String> {
+        if let Some(state) = &self.state {
+            state.failed_files.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 清空失败任务列表（用于重试）
+    pub fn clear_failed_files(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.failed_files.clear();
+        }
+    }
+
+    /// 从失败列表中移除指定文件（重试成功后调用）
+    pub fn remove_from_failed(&mut self, relative_path: &str) {
+        if let Some(state) = &mut self.state {
+            state.failed_files.remove(relative_path);
+        }
+    }
 }
 
 impl Drop for ProgressManager {

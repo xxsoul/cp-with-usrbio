@@ -60,4 +60,13 @@ pub struct Args {
     /// 是否启用debug模式，打印详细的堆栈跟踪信息
     #[arg(short = 'd', long)]
     pub debug: bool,
+
+    /// 校验模式：比对source和target的文件一致性（仅比较文件大小）
+    /// 发现不一致或缺失时询问是否重传
+    #[arg(short = 'v', long)]
+    pub verify: bool,
+
+    /// 自动同意所有重传请求（配合--verify使用）
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }

@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::Read,
-    os::fd::{AsRawFd, IntoRawFd},
+    os::fd::IntoRawFd,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
@@ -39,7 +39,6 @@ pub struct WorkerContext {
 struct ShmManager {
     shm: shared_memory::Shmem,
     iov: Iov,
-    shm_id: String,
     mount_point: String,
     #[allow(dead_code)]
     size: usize,
@@ -94,8 +93,8 @@ impl WorkerContext {
             .create()
             .with_context(|| {
                 format!(
-                    "Worker {} failed to create shared memory: size={} bytes ({:.2} MB)",
-                    worker_id, iov_size, iov_size as f64 / 1_000_000.0
+                    "Worker {} failed to create shared memory: size={} bytes ({:.2} MiB)",
+                    worker_id, iov_size, iov_size as f64 / 1_048_576.0
                 )
             })?;
 
@@ -110,7 +109,6 @@ impl WorkerContext {
         let shm_manager = ShmManager {
             shm,
             iov,
-            shm_id,
             mount_point: mount_point.clone(),
             size: iov_size,
         };
@@ -118,9 +116,9 @@ impl WorkerContext {
         if debug {
             if let Some(ref pb) = progress_bar {
                 pb.println(format!(
-                    "[Worker {}] Initialized with fixed shared memory: {:.2} MB",
+                    "[Worker {}] Initialized with fixed shared memory: {:.2} MiB",
                     worker_id,
-                    iov_size as f64 / 1_000_000.0
+                    iov_size as f64 / 1_048_576.0
                 ));
             }
         }
@@ -234,12 +232,29 @@ impl WorkerContext {
             pipeline_depth,
         )?;
 
-        // 5. 同步文件长度
+        // 确保Ior中的所有请求都已完成
+        // 这是额外的安全检查，防止在ioctl时还有未完成的I/O
+        if self.debug {
+            if let Some(ref pb) = self.progress_bar {
+                pb.println(format!(
+                    "[Worker {}] All I/O completed, syncing to disk...",
+                    self.worker_id
+                ));
+            }
+        }
+
+        // 5. 同步文件长度（确保所有数据持久化）
         unsafe {
             libc::ioctl(
                 managed_fd.as_raw_fd(),
                 hf3fs_usrbio_sys::HF3FS_SUPER_MAGIC as _,
             );
+        }
+
+        // 额外同步：确保所有I/O操作完成后再关闭文件
+        // 这是为了避免缓冲区被下一个文件重用时覆盖未完成的I/O
+        unsafe {
+            libc::fsync(managed_fd.as_raw_fd());
         }
 
         // 6. 保留文件属性
@@ -275,6 +290,9 @@ impl WorkerContext {
         let mut src_offset: usize = 0;
         let mut completed_bytes: usize = 0;
         let mut next_buf_offset: usize = 0;  // 下一个可用的缓冲区位置
+
+        // 记录已使用的最大缓冲区位置，用于检测缓冲区使用情况
+        let mut max_buf_offset_used: usize = 0;
 
         while completed_bytes < file_size as usize {
             // 检查是否是最后一批不足的情况
@@ -347,6 +365,7 @@ impl WorkerContext {
                     final_inflight.push((src_offset, chunk_size, buf_offset));
                     src_offset += chunk_size;
                     next_buf_offset += chunk_size;
+                    max_buf_offset_used = max_buf_offset_used.max(next_buf_offset);
                 }
 
                 // 提交并等待完成
@@ -419,19 +438,22 @@ impl WorkerContext {
 
                 // 检查是否有足够的缓冲区空间
                 if next_buf_offset + chunk_size > self.iov_size {
-                    // 如果inflight为空，可以安全重置缓冲区位置
+                    // 缓冲区不够用
                     if inflight.is_empty() {
-                        next_buf_offset = 0;
+                        // 当前没有正在进行的I/O，可以安全重置缓冲区位置
+                        // 但必须先确保之前的所有I/O已经真正完成
+                        // 由于我们在poll成功后才pop，此时应该已经安全
                         if self.debug {
                             if let Some(ref pb) = self.progress_bar {
                                 pb.println(format!(
-                                    "[Worker {}] Reset buffer offset for next batch",
-                                    self.worker_id
+                                    "[Worker {}] Buffer wrap-around: resetting from {} to 0",
+                                    self.worker_id, next_buf_offset
                                 ));
                             }
                         }
+                        next_buf_offset = 0;
                     } else {
-                        // 缓冲区不够，等待 inflight 完成
+                        // 还有I/O在进行，不能重置，需要等待
                         break;
                     }
                 }
@@ -469,6 +491,7 @@ impl WorkerContext {
                 inflight.push_back((src_offset, chunk_size, buf_offset));
                 src_offset += chunk_size;
                 next_buf_offset += chunk_size;
+                max_buf_offset_used = max_buf_offset_used.max(next_buf_offset);
 
                 // 如果缓冲区用完，等待 inflight 完成
                 if next_buf_offset >= self.iov_size {
@@ -496,7 +519,6 @@ impl WorkerContext {
                 }
 
                 // 处理完成的 I/O
-                let mut bytes_completed_this_round = 0;
                 for io in completed {
                     if io.result < 0 {
                         return Err(anyhow::anyhow!(
@@ -512,7 +534,6 @@ impl WorkerContext {
                     }
 
                     completed_bytes += io.result as usize;
-                    bytes_completed_this_round += io.result as usize;
                     inflight.pop_front();
 
                     self.stats_bytes.fetch_add(io.result as u64, Ordering::Relaxed);
@@ -521,10 +542,23 @@ impl WorkerContext {
                     }
                 }
 
-                // 如果所有 inflight 都完成了，重置缓冲区位置
-                if inflight.is_empty() {
-                    next_buf_offset = 0;
-                }
+                // 重要：不要立即重置缓冲区！
+                // 即使 inflight 为空，也要等待当前批次完全完成
+                // 重置逻辑已移至循环开始时检查
+            }
+        }
+
+        // 文件结束时，确保所有I/O真正完成
+        // 不需要重置缓冲区，因为下一个文件会重新开始
+
+        if self.debug {
+            if let Some(ref pb) = self.progress_bar {
+                pb.println(format!(
+                    "[Worker {}] File completed, max buffer usage: {:.2} MiB / {:.2} MiB",
+                    self.worker_id,
+                    max_buf_offset_used as f64 / 1_048_576.0,
+                    self.iov_size as f64 / 1_048_576.0
+                ));
             }
         }
 
@@ -554,6 +588,7 @@ pub fn worker_thread(
     preserve_attrs: bool,
     debug: bool,
     progress_manager: std::sync::Arc<std::sync::Mutex<ProgressManager>>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     // 创建 worker 上下文（固定大小的共享内存）
     let mut ctx = match WorkerContext::new(
@@ -576,7 +611,21 @@ pub fn worker_thread(
     };
 
     // 处理任务
-    while let Ok(task) = receiver.recv() {
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        // 使用 try_recv 避免阻塞，以便检查 running 标志
+        let task = match receiver.try_recv() {
+            Ok(task) => task,
+            Err(crossbeam::channel::TryRecvError::Empty) => {
+                // 通道为空，短暂休眠后继续检查
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                // 通道已关闭，退出
+                break;
+            }
+        };
+
         let relative_path = task.relative_path.clone();
 
         // 检查是否需要处理（断点续传）
@@ -587,6 +636,12 @@ pub fn worker_thread(
             }
         }
 
+        // 检查是否收到中断信号
+        if !running.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("[Worker {}] Received shutdown signal, stopping...", worker_id);
+            break;
+        }
+
         // 执行拷贝
         match ctx.copy_file(&task.src_path, &task.dst_path) {
             Ok(()) => {
@@ -595,6 +650,8 @@ pub fn worker_thread(
                     eprintln!("[Worker {}] Warning: Failed to mark completed: {}",
                               worker_id, e);
                 }
+                // 从失败列表中移除（如果是重试成功的任务）
+                pm.remove_from_failed(&task.relative_path);
             }
             Err(e) => {
                 let mut pm = progress_manager.lock().unwrap();

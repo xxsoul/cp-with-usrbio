@@ -67,6 +67,7 @@ fn get_shm_usage() -> Result<(u64, u64)> {
 /// # 返回
 /// - Ok(()) 如果空间足够
 /// - Err 包含详细信息的错误
+#[allow(dead_code)]
 fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
     let available = get_shm_available_space()?;
     let (total, used) = get_shm_usage()?;
@@ -75,10 +76,10 @@ fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
     let required_with_margin = (required_size as f64 * (1.0 + safety_margin)) as u64;
 
     if available < required_with_margin {
-        let available_mb = available as f64 / 1_000_000.0;
-        let required_mb = required_size as f64 / 1_000_000.0;
-        let total_mb = total as f64 / 1_000_000.0;
-        let used_mb = used as f64 / 1_000_000.0;
+        let available_mb = available as f64 / 1_048_576.0;
+        let required_mb = required_size as f64 / 1_048_576.0;
+        let total_mb = total as f64 / 1_048_576.0;
+        let used_mb = used as f64 / 1_048_576.0;
         let used_percent = (used as f64 / total as f64) * 100.0;
 
         return Err(anyhow::anyhow!(
@@ -86,12 +87,12 @@ fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
              📊 /dev/shm Status:\n\
              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-               Total:      {:>8.2} MB\n\
-               Used:       {:>8.2} MB ({:.1}%)\n\
-               Available:  {:>8.2} MB\n\
+               Total:      {:>8.2} MiB\n\
+               Used:       {:>8.2} MiB ({:.1}%)\n\
+               Available:  {:>8.2} MiB\n\
              \n\
-             🎯 Required: {:>8.2} MB (with {:.0}% safety margin)\n\
-             ❌ Shortage: {:>8.2} MB\n\
+             🎯 Required: {:>8.2} MiB (with {:.0}% safety margin)\n\
+             ❌ Shortage: {:>8.2} MiB\n\
              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
              \n\
              💡 Solutions:\n\
@@ -100,7 +101,7 @@ fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
                 --workers 2\n\
              \n\
              2. Reduce max shared memory per worker:\n\
-                --max-iov-size 67108864  # 64MB\n\
+                --max-iov-size 67108864  # 64MiB\n\
              \n\
              3. Clean up /dev/shm:\n\
                 rm -f /dev/shm/cp_usrbio_*\n\
@@ -117,7 +118,7 @@ fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
             available_mb,
             required_mb,
             safety_margin * 100.0,
-            (required_with_margin - available) as f64 / 1_000_000.0
+            (required_with_margin - available) as f64 / 1_048_576.0
         ));
     }
 
@@ -130,6 +131,7 @@ fn check_shm_space(required_size: usize, safety_margin: f64) -> Result<()> {
 pub struct ShmManager {
     #[allow(dead_code)]
     shm: shared_memory::Shmem,
+    #[allow(dead_code)]
     pub iov: Iov,
     #[allow(dead_code)]
     pub shm_id: String,
@@ -143,6 +145,7 @@ impl ShmManager {
     /// - iov_size: 共享内存大小（字节）
     /// - debug: 是否启用debug模式
     /// - progress_bar: 可选的进度条（用于debug输出）
+    #[allow(dead_code)]
     pub fn new(
         mount_point: &str,
         iov_size: usize,
@@ -182,10 +185,10 @@ impl ShmManager {
                 format!(
                     "Failed to create shared memory\n\
                      [DEBUG] Shared memory ID: {}\n\
-                     [DEBUG] Requested size: {} bytes ({:.2} MB)\n\
-                     [DEBUG] /dev/shm Total: {:.2} MB\n\
-                     [DEBUG] /dev/shm Used: {:.2} MB\n\
-                     [DEBUG] /dev/shm Available: {:.2} MB\n\
+                     [DEBUG] Requested size: {} bytes ({:.2} MiB)\n\
+                     [DEBUG] /dev/shm Total: {:.2} MiB\n\
+                     [DEBUG] /dev/shm Used: {:.2} MiB\n\
+                     [DEBUG] /dev/shm Available: {:.2} MiB\n\
                      \n\
                      💡 This might be due to:\n\
                      1. Insufficient /dev/shm space (see above)\n\
@@ -197,10 +200,10 @@ impl ShmManager {
                      Backtrace:\n{}",
                     shm_id,
                     iov_size,
-                    iov_size as f64 / 1_000_000.0,
-                    total as f64 / 1_000_000.0,
-                    used as f64 / 1_000_000.0,
-                    available as f64 / 1_000_000.0,
+                    iov_size as f64 / 1_048_576.0,
+                    total as f64 / 1_048_576.0,
+                    used as f64 / 1_048_576.0,
+                    available as f64 / 1_048_576.0,
                     backtrace
                 )
             })?;
@@ -275,6 +278,7 @@ impl ShmManager {
     }
 
     /// 获取共享内存指针
+    #[allow(dead_code)]
     pub fn as_ptr(&self) -> *mut u8 {
         self.shm.as_ptr()
     }
@@ -324,9 +328,9 @@ pub fn show_shm_status() -> Result<()> {
     let (total, used) = get_shm_usage()?;
     let available = get_shm_available_space()?;
 
-    let total_mb = total as f64 / 1_000_000.0;
-    let used_mb = used as f64 / 1_000_000.0;
-    let available_mb = available as f64 / 1_000_000.0;
+    let total_mb = total as f64 / 1_048_576.0;
+    let used_mb = used as f64 / 1_048_576.0;
+    let available_mb = available as f64 / 1_048_576.0;
     let used_percent = if total > 0 {
         (used as f64 / total as f64) * 100.0
     } else {
@@ -336,9 +340,9 @@ pub fn show_shm_status() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("📊 /dev/shm Memory Status");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Total:      {:>8.2} MB", total_mb);
-    println!("Used:       {:>8.2} MB ({:.1}%)", used_mb, used_percent);
-    println!("Available:  {:>8.2} MB", available_mb);
+    println!("Total:      {:>8.2} MiB", total_mb);
+    println!("Used:       {:>8.2} MiB ({:.1}%)", used_mb, used_percent);
+    println!("Available:  {:>8.2} MiB", available_mb);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // 列出可能相关的文件
@@ -358,11 +362,11 @@ pub fn show_shm_status() -> Result<()> {
             println!("\n⚠️  Found {} cp-with-usrbio shared memory files:", our_files.len());
             let total_ours: u64 = our_files.iter().map(|(_, size)| *size).sum();
             for (name, size) in our_files {
-                println!("  {} ({:.2} MB)", name, size as f64 / 1_000_000.0);
+                println!("  {} ({:.2} MiB)", name, size as f64 / 1_048_576.0);
             }
             println!(
-                "Total: {:.2} MB",
-                total_ours as f64 / 1_000_000.0
+                "Total: {:.2} MiB",
+                total_ours as f64 / 1_048_576.0
             );
             println!("\n💡 Run with --shm-status to clean them up");
         }
