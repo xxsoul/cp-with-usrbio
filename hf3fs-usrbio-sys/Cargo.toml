@@ -2,6 +2,12 @@
 name = "hf3fs-usrbio-sys"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["cp-with-usrbio Contributors"]
+description = "Rust bindings for 3FS USRBIO API"
+repository = "https://github.com/xxsoul/cp-with-usrbio"
+keywords = ["3fs", "usrbio", "bindings", "ffi"]
+categories = ["external-ffi-bindings"]
 
 [dependencies]
 shared_memory = "0.12.4"

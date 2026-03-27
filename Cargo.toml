@@ -2,6 +2,13 @@
 name = "cp-with-usrbio"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["cp-with-usrbio Contributors"]
+description = "High-performance file copy tool using USRBIO for 3FS"
+repository = "https://github.com/xxsoul/cp-with-usrbio"
+readme = "README.md"
+keywords = ["3fs", "usrbio", "copy", "zero-copy", "distributed-filesystem"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 hf3fs-usrbio-sys = { path = "hf3fs-usrbio-sys" }

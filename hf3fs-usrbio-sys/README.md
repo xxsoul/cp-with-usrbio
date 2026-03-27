@@ -89,3 +89,7 @@ cargo build
 1. 独立的头文件管理（不再依赖3FS源码树）
 2. 更清晰的构建配置
 3. 适合特定项目需求的自定义修改
+
+## License
+
+本项目作为 [cp-with-usrbio](https://github.com/xxsoul/cp-with-usrbio) 的一部分，采用 MIT 许可证开源。详见项目根目录的 [LICENSE](../LICENSE) 文件。
