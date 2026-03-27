@@ -27,6 +27,21 @@ export HF3FS_BUILD_DIR=/root/code/3fs/build
 export LD_LIBRARY_PATH=$HF3FS_BUILD_DIR/src/lib/api:$LD_LIBRARY_PATH
 ```
 
+**注意**: 本项目包含了独立的 `hf3fs-usrbio-sys` Rust绑定，不依赖3FS源码树中的绑定代码。
+
+⚠️ **版本匹配检查（重要）**
+
+本项目包含独立的 `hf3fs-usrbio-sys` Rust绑定，其中的头文件来自3FS源码快照。
+
+**在首次使用或更新3FS版本后，必须确认头文件版本匹配**：
+
+1. 对比您的3FS源码头文件与本项目的头文件
+2. 如有差异，将您的3FS头文件复制到 `hf3fs-usrbio-sys/include/`
+3. 检查 `hf3fs-usrbio-sys/src/lib.rs` 是否需要相应调整
+4. 重新构建
+
+详细说明请参见 [hf3fs-usrbio-sys/README.md](hf3fs-usrbio-sys/README.md)。
+
 ### 构建
 
 ```bash
@@ -196,6 +211,40 @@ watch -n 1 'ls /dev/shm/cp_usrbio_* | wc -l'
 
 ## 故障排除
 
+### 问题 0: 头文件版本不匹配
+
+**症状**:
+- 链接错误：符号未定义
+- 运行时段错误或崩溃
+- 编译错误：类型不匹配
+
+**原因**: 本项目的头文件与部署的3FS版本不一致
+
+**解决**:
+```bash
+# 1. 检查差异
+diff /root/code/3fs/src/lib/api/hf3fs_usrbio.h \
+     hf3fs-usrbio-sys/include/hf3fs_usrbio.h
+
+# 2. 更新头文件
+cp /root/code/3fs/src/lib/api/hf3fs_usrbio.h \
+   hf3fs-usrbio-sys/include/hf3fs_usrbio.h
+
+# 3. 检查Rust封装代码是否需要调整
+#    查看 hf3fs-usrbio-sys/src/lib.rs
+#    特别关注API签名、结构体字段等
+
+# 4. 重新构建
+cargo clean
+./build.sh
+```
+
+**预防措施**:
+- 每次更新3FS后都检查头文件
+- 在 `hf3fs-usrbio-sys/README.md` 中记录版本信息
+
+---
+
 ### 问题 1: 找不到动态库
 
 **错误**: `error while loading shared libraries: libhf3fs_api_shared.so`
@@ -271,10 +320,11 @@ tmpfs /dev/shm tmpfs defaults,size=8G 0 0
 
 ```
 cp-with-usrbio (Rust)
-├── hf3fs-usrbio-sys (本地路径依赖)
-│   ├── 绑定 hf3fs_usrbio.h (C API)
-│   ├── 链接 libhf3fs_api_shared.so
-│   └── 依赖: shared_memory, uuid
+├── hf3fs-usrbio-sys (本地子项目)
+│   ├── include/hf3fs_usrbio.h (C API头文件)
+│   ├── src/lib.rs (Rust封装实现)
+│   ├── build.rs (bindgen生成绑定)
+│   └── 依赖: shared_memory, uuid, bindgen
 ├── clap (CLI 解析)
 ├── crossbeam (并发原语)
 ├── indicatif (进度条)

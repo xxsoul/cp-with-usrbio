@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hf3fs-usrbio-sys = { path = "/root/code/3fs/src/lib/rs/hf3fs-usrbio-sys" }
+hf3fs-usrbio-sys = { path = "hf3fs-usrbio-sys" }
 clap = { version = "4", features = ["derive"] }
 shared_memory = "0.12.4"
 uuid = { version = "1.13.2", features = ["v4"] }
