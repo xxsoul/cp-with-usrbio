@@ -216,6 +216,18 @@ fn main() -> Result<()> {
         println!("📊 Verification Result");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("Files checked:    {}", verify_result.total_checked);
+
+        // 格式化总容量显示
+        let total_bytes_gb = verify_result.total_bytes as f64 / 1_073_741_824.0;
+        let total_bytes_mb = verify_result.total_bytes as f64 / 1_048_576.0;
+        if total_bytes_gb >= 1.0 {
+            println!("Total capacity:   {:.2} GiB ({} bytes)", total_bytes_gb, verify_result.total_bytes);
+        } else if total_bytes_mb >= 1.0 {
+            println!("Total capacity:   {:.2} MiB ({} bytes)", total_bytes_mb, verify_result.total_bytes);
+        } else {
+            println!("Total capacity:   {} bytes", verify_result.total_bytes);
+        }
+
         println!("Missing files:    {}", verify_result.missing_files.len());
         println!("Size mismatch:    {}", verify_result.size_mismatch.len());
         println!("Total issues:     {}", verify_result.total_issues);

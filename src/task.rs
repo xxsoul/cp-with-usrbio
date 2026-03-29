@@ -13,6 +13,7 @@ pub struct VerifyResult {
     pub missing_files: Vec<String>,      // target缺失的文件
     pub size_mismatch: Vec<String>,      // 大小不一致的文件
     pub total_checked: usize,            // 总检查文件数
+    pub total_bytes: u64,                // 总文件容量（字节）
     pub total_issues: usize,             // 总问题文件数
 }
 
@@ -223,6 +224,7 @@ pub fn verify_files(
     let mut missing_files = Vec::new();
     let mut size_mismatch = Vec::new();
     let mut total_checked = 0;
+    let mut total_bytes: u64 = 0;
 
     if source.is_file() {
         // 单文件模式
@@ -230,6 +232,8 @@ pub fn verify_files(
 
         let src_metadata = std::fs::metadata(source)
             .with_context(|| format!("Failed to get metadata: {:?}", source))?;
+
+        total_bytes = src_metadata.len();
 
         if !target.exists() {
             let relative_path = source
@@ -280,6 +284,8 @@ pub fn verify_files(
                     }
                 };
 
+                total_bytes += src_metadata.len();
+
                 // 检查目标文件是否存在
                 if !dst_path.exists() {
                     let relative_path = rel_path.to_str().unwrap_or("unknown").to_string();
@@ -312,6 +318,7 @@ pub fn verify_files(
         missing_files,
         size_mismatch,
         total_checked,
+        total_bytes,
         total_issues,
     })
 }
